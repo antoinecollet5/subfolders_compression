@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 BROTLI_QUALITY = 0  # 0–11  │ 11 = best ratio; drop to 6 for ~3× speed
 BROTLI_LGWIN = 24  # 10–24 │ 24 = largest window → best ratio on large inputs
+_UPDATE_EVERY = 1 * 1024 * 1024  # send a progress tick every 1 MB
 
 _queue = None
 
@@ -32,12 +33,21 @@ class _BrotliWriter:
         self._f = f
         self._compressor = compressor
         self._name = name
+        self._pending = 0  # bytes accumulated since last tick
 
     def write(self, data: bytes) -> int:
         self._f.write(self._compressor.process(data))
-        if _queue is not None:
-            _queue.put(("progress", self._name, len(data)))
+        self._pending += len(data)
+        if _queue is not None and self._pending >= _UPDATE_EVERY:
+            _queue.put(("progress", self._name, self._pending))
+            self._pending = 0
         return len(data)
+
+    def flush(self):
+        """Call after tar is done to report the last partial chunk."""
+        if _queue is not None and self._pending > 0:
+            _queue.put(("progress", self._name, self._pending))
+            self._pending = 0
 
 
 def make_archive(simu_path: Path, target_dir_path: Path) -> str:
@@ -64,6 +74,7 @@ def make_archive(simu_path: Path, target_dir_path: Path) -> str:
         with tarfile.open(fileobj=writer, mode="w|") as tar:  # ty:ignore[no-matching-overload]
             tar.add(simu_path, arcname=simu_path.name)
 
+        writer.flush()
         raw_file.write(compressor.finish())
         raw_file.close()
         tmp_path.rename(target_path)
