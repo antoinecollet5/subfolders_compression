@@ -19,7 +19,6 @@ from tqdm import tqdm
 BROTLI_QUALITY = 0  # 0–11  │ 11 = best ratio; drop to 6 for ~3× speed
 BROTLI_LGWIN = 24  # 10–24 │ 24 = largest window → best ratio on large inputs
 _UPDATE_EVERY = 1 * 1024 * 1024  # send a progress tick every 1 MB
-
 _queue = None
 
 
@@ -44,7 +43,7 @@ class _BrotliWriter:
         return len(data)
 
     def flush(self):
-        """Call after tar is done to report the last partial chunk."""
+        """Flush remaining accumulated bytes after tar streaming is done."""
         if _queue is not None and self._pending > 0:
             _queue.put(("progress", self._name, self._pending))
             self._pending = 0
@@ -74,7 +73,7 @@ def make_archive(simu_path: Path, target_dir_path: Path) -> str:
         with tarfile.open(fileobj=writer, mode="w|") as tar:  # ty:ignore[no-matching-overload]
             tar.add(simu_path, arcname=simu_path.name)
 
-        writer.flush()
+        writer.flush()  # report the last partial chunk
         raw_file.write(compressor.finish())
         raw_file.close()
         tmp_path.rename(target_path)
@@ -93,9 +92,9 @@ def _listen(queue, n_slots: int, overall: tqdm):
     Manages per-folder tqdm bars.
 
     Protocol messages from workers:
-      ("start",    name, total_bytes)  — archive started, open a bar
-      ("progress", name, n_bytes)      — n compressed bytes read
-      ("done",     name, 0)            — archive finished, close bar
+      ("start",    name, total_bytes)  — folder started, open a bar
+      ("progress", name, n_bytes)      — n input bytes processed
+      ("done",     name, 0)            — folder finished, close bar
       None                             — sentinel: shut down
     """
     bars: dict[str, tqdm] = {}
@@ -110,7 +109,7 @@ def _listen(queue, n_slots: int, overall: tqdm):
         kind, name, value = msg
 
         if kind == "start":
-            if name in finished_early:  # already done, skip the bar
+            if name in finished_early:  # already done, skip opening a bar
                 finished_early.discard(name)
                 continue
             pos = free_slots.pop(0) if free_slots else len(bars) + 1
@@ -138,20 +137,20 @@ def _listen(queue, n_slots: int, overall: tqdm):
                     free_slots.append(slot)
                     free_slots.sort()
             else:
-                finished_early.add(name)  # remember for when "start" arrives
+                finished_early.add(name)  # "start" may still be in flight
             overall.update(1)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compress sub-folders to .tar.br with brotli q11."
+        description="Compress sub-folders to .tar.br with brotli."
     )
     parser.add_argument("folder", help="Source directory whose sub-folders to compress")
     parser.add_argument(
         "--workers",
         type=int,
         default=-1,
-        help="Parallel compression workers (default: -1, i.e., all cpu cores)",
+        help="Parallel compression workers (default: -1, i.e., all CPU cores)",
     )
     parser.add_argument(
         "--quality",
@@ -159,7 +158,7 @@ if __name__ == "__main__":
         default=BROTLI_QUALITY,
         choices=range(0, 12),
         metavar="[0-11]",
-        help="Brotli quality level (default: 0 = min ratio)",
+        help="Brotli quality level (default: 0 = fastest)",
     )
     args = parser.parse_args()
     BROTLI_QUALITY = args.quality
@@ -197,15 +196,14 @@ if __name__ == "__main__":
     )
     listener.start()
 
-    # Pass the queue once at worker startup — no per-call pickling
+    # Queue is injected once at worker startup — no per-call pickling
     with ProcessPoolExecutor(
         max_workers=n_workers,
         initializer=_init_worker,
         initargs=(queue,),
     ) as executor:
         futures = {
-            executor.submit(make_archive, p, target_dir_path): p  # no queue arg
-            for p in simu_paths
+            executor.submit(make_archive, p, target_dir_path): p for p in simu_paths
         }
         for future in as_completed(futures):
             try:
