@@ -15,7 +15,7 @@ import brotli
 from tqdm import tqdm
 
 
-BROTLI_QUALITY = 11  # 0–11  │ 11 = best ratio; drop to 6 for ~3× speed
+BROTLI_QUALITY = 0  # 0–11  │ 11 = best ratio; drop to 6 for ~3× speed
 BROTLI_LGWIN = 24  # 10–24 │ 24 = largest window → best ratio on large inputs
 
 
@@ -137,7 +137,7 @@ if __name__ == "__main__":
         default=BROTLI_QUALITY,
         choices=range(0, 12),
         metavar="[0-11]",
-        help="Brotli quality level (default: 11 = max ratio)",
+        help="Brotli quality level (default: 0 = min ratio)",
     )
     args = parser.parse_args()
     BROTLI_QUALITY = args.quality
