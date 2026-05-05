@@ -10,23 +10,29 @@ compressed file you are rather than how much data has been inflated.
 """
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Manager
+from multiprocessing import Queue
 from pathlib import Path
 import tarfile
 import argparse
 import threading
 import shutil
-
+import os
 import brotli
 from tqdm import tqdm
 
+_queue = None
+
+
+def _init_worker(q):
+    global _queue
+    _queue = q
+
 
 class _BrotliReader:
-    def __init__(self, f, queue=None, name: str = ""):
+    def __init__(self, f, name: str = ""):
         self._f = f
         self._decompressor = brotli.Decompressor()
         self._buf = b""
-        self._queue = queue
         self._name = name
 
     def read(self, size: int = -1) -> bytes:
@@ -34,8 +40,8 @@ class _BrotliReader:
             chunk = self._f.read(65536)
             if not chunk:
                 break
-            if self._queue is not None:
-                self._queue.put(("progress", self._name, len(chunk)))
+            if _queue is not None:
+                _queue.put(("progress", self._name, len(chunk)))
             self._buf += self._decompressor.process(chunk)
 
         if size < 0:
@@ -48,24 +54,24 @@ class _BrotliReader:
         return True
 
 
-def decompress_archive(archive_path: Path, target_dir_path: Path, queue=None) -> str:
+def decompress_archive(archive_path: Path, target_dir_path: Path) -> str:
     target_path = target_dir_path / archive_path.stem  # strips .tar.br → folder name
 
     if target_path.exists():
-        if queue:
-            queue.put(("done", archive_path.name, 0))
+        if _queue:
+            _queue.put(("done", archive_path.name, 0))
         return f"already done {archive_path.name}"
 
     # Compressed file size drives the progress bar.
     total_bytes = archive_path.stat().st_size
-    if queue:
-        queue.put(("start", archive_path.name, total_bytes))
+    if _queue:
+        _queue.put(("start", archive_path.name, total_bytes))
 
     tmp_path = target_path.with_suffix(".tmp")
     tmp_path.mkdir(parents=True, exist_ok=True)
     try:
         raw_file = archive_path.open("rb")
-        reader = _BrotliReader(raw_file, queue, archive_path.name)
+        reader = _BrotliReader(raw_file, archive_path.name)
 
         with tarfile.open(fileobj=reader, mode="r|") as tar:  # ty:ignore[no-matching-overload]
             tar.extractall(path=tmp_path)
@@ -76,8 +82,8 @@ def decompress_archive(archive_path: Path, target_dir_path: Path, queue=None) ->
         shutil.rmtree(tmp_path, ignore_errors=True)
         raise
     finally:
-        if queue:
-            queue.put(("done", archive_path.name, 0))
+        if _queue:
+            _queue.put(("done", archive_path.name, 0))
 
     return f"done {archive_path.name}"
 
@@ -94,6 +100,7 @@ def _listen(queue, n_slots: int, overall: tqdm):
     """
     bars: dict[str, tqdm] = {}
     free_slots: list[int] = list(range(1, n_slots + 1))
+    finished_early: set[str] = set()  # "done" arrived before "start"
 
     while True:
         msg = queue.get()
@@ -103,6 +110,9 @@ def _listen(queue, n_slots: int, overall: tqdm):
         kind, name, value = msg
 
         if kind == "start":
+            if name in finished_early:  # already done, skip the bar
+                finished_early.discard(name)
+                continue
             pos = free_slots.pop(0) if free_slots else len(bars) + 1
             bars[name] = tqdm(
                 total=value,
@@ -127,6 +137,8 @@ def _listen(queue, n_slots: int, overall: tqdm):
                 if slot is not None:
                     free_slots.append(slot)
                     free_slots.sort()
+            else:
+                finished_early.add(name)  # remember for when "start" arrives
             overall.update(1)
 
 
@@ -138,10 +150,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workers",
         type=int,
-        default=2,
-        help="Parallel decompression workers (default: 2)",
+        default=-1,
+        help="Parallel decompression workers (default: -1, i.e., all cpu cores)",
     )
     args = parser.parse_args()
+
+    n_workers = os.cpu_count() if args.workers == -1 else args.workers
 
     source_path = Path(args.folder)
     if not source_path.is_dir():
@@ -159,11 +173,10 @@ if __name__ == "__main__":
 
     print(
         f"Decompressing {len(archive_paths)} archive(s) → {target_dir_path}  "
-        f"[{args.workers} workers]"
+        f"[{n_workers} workers]"
     )
 
-    manager = Manager()
-    queue = manager.Queue()
+    queue = Queue()
 
     overall = tqdm(
         total=len(archive_paths),
@@ -173,13 +186,18 @@ if __name__ == "__main__":
         dynamic_ncols=True,
     )
     listener = threading.Thread(
-        target=_listen, args=(queue, args.workers, overall), daemon=True
+        target=_listen, args=(queue, n_workers, overall), daemon=True
     )
     listener.start()
 
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+    # Pass the queue once at worker startup — no per-call pickling
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_init_worker,
+        initargs=(queue,),
+    ) as executor:
         futures = {
-            executor.submit(decompress_archive, p, target_dir_path, queue): p
+            executor.submit(decompress_archive, p, target_dir_path): p
             for p in archive_paths
         }
         for future in as_completed(futures):
