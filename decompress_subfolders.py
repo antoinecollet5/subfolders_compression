@@ -1,12 +1,12 @@
 """
-Script to decompress .tar.br archives (tar + brotli).
+Script to decompress .tar.zst archives (tar + zstd).
 Shows one progress bar per active archive + an overall bar.
 
-The one difference vs compression: the bar tracks compressed bytes read from the
-.tar.br file (since that's what _BrotliReader sees chunk by chunk), not uncompressed
-bytes. The total is just archive_path.stat().st_size, which is instant to get.
-The bar will still be smooth and accurate — it just reflects how far through the
-compressed file you are rather than how much data has been inflated.
+The bar tracks compressed bytes read from the .tar.zst file (since that's what
+the progress reader sees chunk by chunk), not uncompressed bytes. The total is
+just archive_path.stat().st_size, which is instant to get. The bar will still
+be smooth and accurate — it just reflects how far through the compressed file
+you are rather than how much data has been inflated.
 """
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -17,8 +17,14 @@ import argparse
 import threading
 import shutil
 import os
-import brotli
+
+import zstandard as zstd
 from tqdm import tqdm
+
+# Permit the larger windows produced by long-range mode (LDM) at compression
+# time. zstd's default cap of 128 MiB rejects them; 2 GiB is well above any
+# realistic LDM window and still prevents pathological memory bombs.
+ZSTD_MAX_WINDOW = 2**31
 
 _queue = None
 
@@ -28,34 +34,32 @@ def _init_worker(q):
     _queue = q
 
 
-class _BrotliReader:
-    def __init__(self, f, name: str = ""):
-        self._f = f
-        self._decompressor = brotli.Decompressor()
-        self._buf = b""
+class _ProgressReader:
+    """File-like wrapper that counts compressed bytes pulled from the raw
+    file and reports them to the progress queue, then forwards the data
+    to whoever called .read() (the zstd stream_reader)."""
+
+    def __init__(self, inner, name: str = ""):
+        self._inner = inner
         self._name = name
 
     def read(self, size: int = -1) -> bytes:
-        while size < 0 or len(self._buf) < size:
-            chunk = self._f.read(65536)
-            if not chunk:
-                break
-            if _queue is not None:
-                _queue.put(("progress", self._name, len(chunk)))
-            self._buf += self._decompressor.process(chunk)
-
-        if size < 0:
-            data, self._buf = self._buf, b""
-        else:
-            data, self._buf = self._buf[:size], self._buf[size:]
-        return data
+        chunk = self._inner.read(size)
+        if chunk and _queue is not None:
+            _queue.put(("progress", self._name, len(chunk)))
+        return chunk
 
     def readable(self) -> bool:
         return True
 
+    def close(self):
+        self._inner.close()
+
 
 def decompress_archive(archive_path: Path, target_dir_path: Path) -> str:
-    target_path = target_dir_path / archive_path.stem  # strips .tar.br → folder name
+    # Strip both ".tar" and ".zst" so "foo.tar.zst" → folder "foo"
+    folder_name = archive_path.name.removesuffix(".tar.zst")
+    target_path = target_dir_path / folder_name
 
     if target_path.exists():
         if _queue:
@@ -67,16 +71,17 @@ def decompress_archive(archive_path: Path, target_dir_path: Path) -> str:
     if _queue:
         _queue.put(("start", archive_path.name, total_bytes))
 
-    tmp_path = target_path.with_suffix(".tmp")
+    tmp_path = target_dir_path / (folder_name + ".tmp")
     tmp_path.mkdir(parents=True, exist_ok=True)
     try:
-        raw_file = archive_path.open("rb")
-        reader = _BrotliReader(raw_file, archive_path.name)
-
-        with tarfile.open(fileobj=reader, mode="r|") as tar:  # ty:ignore[no-matching-overload]
-            tar.extractall(path=tmp_path)
-
-        raw_file.close()
+        dctx = zstd.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW)
+        with archive_path.open("rb") as raw_file:
+            progress = _ProgressReader(raw_file, archive_path.name)
+            with (
+                dctx.stream_reader(progress) as zstd_reader, 
+                tarfile.open(fileobj=zstd_reader, mode="r|") as tar,
+            ):
+                tar.extractall(path=tmp_path)
         tmp_path.rename(target_path)
     except Exception:
         shutil.rmtree(tmp_path, ignore_errors=True)
@@ -110,7 +115,7 @@ def _listen(queue, n_slots: int, overall: tqdm):
         kind, name, value = msg
 
         if kind == "start":
-            if name in finished_early:  # already done, skip the bar
+            if name in finished_early:
                 finished_early.discard(name)
                 continue
             pos = free_slots.pop(0) if free_slots else len(bars) + 1
@@ -138,15 +143,15 @@ def _listen(queue, n_slots: int, overall: tqdm):
                     free_slots.append(slot)
                     free_slots.sort()
             else:
-                finished_early.add(name)  # remember for when "start" arrives
+                finished_early.add(name)
             overall.update(1)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Decompress .tar.br archives produced by the companion compress script."
+        description="Decompress .tar.zst archives produced by the companion compress script."
     )
-    parser.add_argument("folder", help="Directory containing .tar.br archives")
+    parser.add_argument("folder", help="Directory containing .tar.zst archives")
     parser.add_argument(
         "--workers",
         type=int,
@@ -166,9 +171,9 @@ if __name__ == "__main__":
     )
     target_dir_path.mkdir(parents=True, exist_ok=True)
 
-    archive_paths = sorted(source_path.glob("*.tar.br"))
+    archive_paths = sorted(source_path.glob("*.tar.zst"))
     if not archive_paths:
-        print("No .tar.br archives found — nothing to do.")
+        print("No .tar.zst archives found — nothing to do.")
         raise SystemExit(0)
 
     print(
@@ -190,7 +195,6 @@ if __name__ == "__main__":
     )
     listener.start()
 
-    # Pass the queue once at worker startup — no per-call pickling
     with ProcessPoolExecutor(
         max_workers=n_workers,
         initializer=_init_worker,
@@ -206,7 +210,7 @@ if __name__ == "__main__":
             except Exception as exc:
                 overall.write(f"ERROR — {futures[future].name}: {exc}")
 
-    queue.put(None)  # shut down the listener
+    queue.put(None)
     listener.join()
     overall.close()
     print("All done.")

@@ -1,7 +1,6 @@
 """
-Script to compress folders to .tar.br (tar + brotli) archives.
-Lossless, max compression ratio (quality=11, window=24).
-Shows one progress bar per active folder + an overall bar.
+Script to compress folders to .tar.zst (tar + zstd) archives.
+Lossless. Shows one progress bar per active folder + an overall bar.
 """
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -12,12 +11,12 @@ import argparse
 import threading
 import os
 
-import brotli
+import zstandard as zstd
 from tqdm import tqdm
 
 
-BROTLI_QUALITY = 0  # 0–11  │ 11 = best ratio; drop to 6 for ~3× speed
-BROTLI_LGWIN = 24  # 10–24 │ 24 = largest window → best ratio on large inputs
+ZSTD_LEVEL = 3  # 1–22  │ 22 = best ratio (slow); 3 = default; negative = ultra-fast
+ZSTD_LONG = True  # Long-range mode → much better ratio on large inputs
 _UPDATE_EVERY = 1 * 1024 * 1024  # send a progress tick every 1 MB
 _queue = None
 
@@ -27,15 +26,17 @@ def _init_worker(q):
     _queue = q
 
 
-class _BrotliWriter:
-    def __init__(self, f, compressor, name: str = ""):
-        self._f = f
-        self._compressor = compressor
+class _ProgressWriter:
+    """File-like wrapper that counts input bytes for the progress bar
+    and forwards the data to an inner writer (the zstd stream_writer)."""
+
+    def __init__(self, inner, name: str = ""):
+        self._inner = inner
         self._name = name
         self._pending = 0  # bytes accumulated since last tick
 
     def write(self, data: bytes) -> int:
-        self._f.write(self._compressor.process(data))
+        self._inner.write(data)
         self._pending += len(data)
         if _queue is not None and self._pending >= _UPDATE_EVERY:
             _queue.put(("progress", self._name, self._pending))
@@ -49,11 +50,29 @@ class _BrotliWriter:
             self._pending = 0
 
 
+def _make_compressor() -> zstd.ZstdCompressor:
+    """Build a ZstdCompressor honouring the global level/long settings."""
+    if ZSTD_LONG:
+        params = zstd.ZstdCompressionParameters.from_level(
+            ZSTD_LEVEL,
+            enable_ldm=True,  # long-range matching
+            write_checksum=True,  # 4-byte XXHash64 footer for integrity
+            write_content_size=True,  # so `zstd -l` reports original size
+        )
+        return zstd.ZstdCompressor(compression_params=params, threads=0)
+    return zstd.ZstdCompressor(
+        level=ZSTD_LEVEL,
+        threads=0,  # single-threaded per worker; we parallelize folders
+        write_checksum=True,
+        write_content_size=True,
+    )
+
+
 def make_archive(simu_path: Path, target_dir_path: Path) -> str:
     if simu_path.is_file():
         return f"skip (file)  {simu_path.name}"
 
-    target_path = target_dir_path / (simu_path.stem + ".tar.br")
+    target_path = target_dir_path / (simu_path.stem + ".tar.zst")
     if target_path.exists():
         if _queue:
             _queue.put(("done", simu_path.name, 0))
@@ -66,16 +85,16 @@ def make_archive(simu_path: Path, target_dir_path: Path) -> str:
 
     tmp_path = target_path.with_suffix(".tmp")
     try:
-        compressor = brotli.Compressor(quality=BROTLI_QUALITY, lgwin=BROTLI_LGWIN)
-        raw_file = tmp_path.open("wb")
-        writer = _BrotliWriter(raw_file, compressor, simu_path.name)
-
-        with tarfile.open(fileobj=writer, mode="w|") as tar:  # ty:ignore[no-matching-overload]
-            tar.add(simu_path, arcname=simu_path.name)
-
-        writer.flush()  # report the last partial chunk
-        raw_file.write(compressor.finish())
-        raw_file.close()
+        cctx = _make_compressor()
+        with (
+            tmp_path.open("wb") as raw_file,
+            cctx.stream_writer(raw_file) as zstd_writer,
+        ):
+            progress = _ProgressWriter(zstd_writer, simu_path.name)
+            with tarfile.open(fileobj=progress, mode="w|") as tar:  # ty:ignore[no-matching-overload]
+                tar.add(simu_path, arcname=".")
+            progress.flush()
+        # zstd_writer.__exit__ flushes the frame epilogue, then raw_file closes.
         tmp_path.rename(target_path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -99,7 +118,7 @@ def _listen(queue, n_slots: int, overall: tqdm):
     """
     bars: dict[str, tqdm] = {}
     free_slots: list[int] = list(range(1, n_slots + 1))
-    finished_early: set[str] = set()  # "done" arrived before "start"
+    finished_early: set[str] = set()
 
     while True:
         msg = queue.get()
@@ -109,7 +128,7 @@ def _listen(queue, n_slots: int, overall: tqdm):
         kind, name, value = msg
 
         if kind == "start":
-            if name in finished_early:  # already done, skip opening a bar
+            if name in finished_early:
                 finished_early.discard(name)
                 continue
             pos = free_slots.pop(0) if free_slots else len(bars) + 1
@@ -137,31 +156,38 @@ def _listen(queue, n_slots: int, overall: tqdm):
                     free_slots.append(slot)
                     free_slots.sort()
             else:
-                finished_early.add(name)  # "start" may still be in flight
+                finished_early.add(name)
             overall.update(1)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compress sub-folders to .tar.br with brotli."
+        description="Compress sub-folders to .tar.zst with zstd."
     )
     parser.add_argument("folder", help="Source directory whose sub-folders to compress")
     parser.add_argument(
         "--workers",
         type=int,
         default=-1,
-        help="Parallel compression workers (default: -1, i.e., all CPU cores)",
+        help="Parallel compression workers (default: -1, i.e. all CPU cores)",
     )
     parser.add_argument(
-        "--quality",
+        "--level",
         type=int,
-        default=BROTLI_QUALITY,
-        choices=range(0, 12),
-        metavar="[0-11]",
-        help="Brotli quality level (default: 0 = fastest)",
+        default=ZSTD_LEVEL,
+        choices=range(1, 23),
+        metavar="[1-22]",
+        help="zstd compression level (default: 3; 22 = best ratio, slow)",
+    )
+    parser.add_argument(
+        "--no-long",
+        action="store_true",
+        help="Disable long-range mode (enabled by default; helps on big inputs)",
     )
     args = parser.parse_args()
-    BROTLI_QUALITY = args.quality
+
+    ZSTD_LEVEL = args.level
+    ZSTD_LONG = not args.no_long
 
     n_workers = os.cpu_count() if args.workers == -1 else args.workers
 
@@ -179,7 +205,7 @@ if __name__ == "__main__":
 
     print(
         f"Compressing {len(simu_paths)} folder(s) → {target_dir_path}  "
-        f"[brotli q{BROTLI_QUALITY}, w{BROTLI_LGWIN}, {n_workers} workers]"
+        f"[zstd L{ZSTD_LEVEL}{' +long' if ZSTD_LONG else ''}, {n_workers} workers]"
     )
 
     queue = Queue()
@@ -196,7 +222,6 @@ if __name__ == "__main__":
     )
     listener.start()
 
-    # Queue is injected once at worker startup — no per-call pickling
     with ProcessPoolExecutor(
         max_workers=n_workers,
         initializer=_init_worker,
@@ -211,7 +236,7 @@ if __name__ == "__main__":
             except Exception as exc:
                 overall.write(f"ERROR — {futures[future].name}: {exc}")
 
-    queue.put(None)  # shut down the listener
+    queue.put(None)
     listener.join()
     overall.close()
     print("All done.")
